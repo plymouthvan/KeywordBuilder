@@ -20,11 +20,13 @@ This repository provides two entry points:
 - Non-interactive CLI: keyword_builder.py — scriptable interface for pipelines and automation.
 
 ## Features
-- Template mode: render phrases from templates like "{core} in {city}, {state}" with multiple secondary CSVs and placeholder validation.
+- Template mode (single or multi-column):
+  - Single-column template strings like "{core} in {city}, {state}" with placeholder validation.
+  - Multi-column template tables (CSV with headers) whose cells may contain placeholders; outputs a CSV preserving the template's headers and columns.
 - Full-permutation mode: insert the core phrase at every position across each row's fields (and optionally across subsets via --min-fields in CLI mode).
-- Stable de-duplication that preserves the first occurrence order.
+- Stable de-duplication that preserves the first occurrence order (applies to keywords and multi-column rows).
 - Row-grouped generation: preserves natural grouping by secondary rows for deterministic output.
-- Match types (guided CLI): broad, phrase, exact formatting.
+- Match types (guided CLI): broad, phrase, exact formatting (single-column/permutation modes).
 - Zero external dependencies (standard library only).
 
 ## Requirements
@@ -50,7 +52,7 @@ python3 run.py
 The flow will prompt you to choose:
 - Core CSV and the core column (default "core")
 - One or more secondary CSVs
-- Optional template CSV (single column with placeholders)
+- Optional template CSV (single- or multi-column with placeholders)
 - Duplicate cleanup
 - Match type (broad | phrase | exact)
 - Output file path (default keywords.txt)
@@ -101,6 +103,16 @@ python3 keyword_builder.py \
   --core-column core
 ```
 
+Multi-column template table mode:
+```bash
+python3 keyword_builder.py \
+  --core core.csv \
+  --secondary venues.csv \
+  --template template_table.csv \
+  --output keywords.csv \
+  --core-column core
+```
+
 Optional: generate across subsets of fields in full-permutation mode:
 ```bash
 python3 keyword_builder.py \
@@ -114,6 +126,7 @@ python3 keyword_builder.py \
 
 Notes:
 - The non-interactive CLI always writes unique keywords (stable de-duplication). Match-type wrapping is part of the guided flow only.
+- For multi-column templates, identical rows are removed with stable de-duplication.
 
 ## CSV specs
 Core CSV:
@@ -129,21 +142,42 @@ Multiple secondary CSVs (template mode):
 - Column names must be unique across files; duplicates will cause an error.
 
 ## Templates
-- Templates are read from a single-column CSV.
+
+Single-column templates:
+- Read from a single-column CSV.
 - Lines starting with '#' and blank lines are ignored.
 - Only rows containing at least one {placeholder} are treated as templates.
 - Allowed placeholders are "core" plus the union of secondary column names.
 
-Examples:
+Example (single-column):
 ```csv
 {core} near {venue} in {city}, {state}
 best {core} {city}
 {venue} {core}
 ```
 
+Multi-column template tables:
+- Read from a CSV with a header row (2+ columns).
+- Each cell may contain zero or more placeholders like {core}, {city}, {state}, {venue}.
+- Rows whose first non-empty cell begins with '#' are ignored.
+- The output will be a CSV that preserves the template's headers and number/order of columns.
+- Allowed placeholders are "core" plus the union of secondary column names.
+- Identical rendered rows are de-duplicated (stable first occurrence).
+
+Example (multi-column CSV):
+```csv
+headline,description,path
+Best {core} in {city},Book your {core} today,services/{city}
+Top {venue} {core},{state} specials available now,offers/{state}/{city}
+```
+
 ## Output
-- Guided flow: choose match type (broad, phrase, exact) and output path; duplicates can be removed before saving.
-- Non-interactive CLI: writes one unique keyword per line to the specified file.
+- Guided flow:
+  - Single-column templates or full-permutation: choose match type (broad, phrase, exact), optional grouping/splitting, and remove duplicates before saving.
+  - Multi-column templates: outputs a CSV preserving template headers/columns; identical rows are de-duplicated (stable). Match-type wrapping and grouping/splitting are skipped.
+- Non-interactive CLI:
+  - Single-column templates and full-permutation: writes one unique keyword per line to the specified file.
+  - Multi-column templates: writes CSV with the original template headers and columns; identical rows are de-duplicated (stable).
 
 ## Tips
 - Permutations grow quickly; prefer Template mode or --min-fields to constrain output size.

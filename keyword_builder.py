@@ -8,6 +8,7 @@ import re
 import sys
 from typing import List, Set, Iterable, Optional, Dict, Tuple
 
+
 def load_core_keywords(path: str, core_column: str) -> List[str]:
     """Loads core phrases from a CSV file."""
     try:
@@ -31,6 +32,7 @@ def load_core_keywords(path: str, core_column: str) -> List[str]:
     except Exception as e:
         print(f"Error reading core file '{path}': {e}", file=sys.stderr)
         sys.exit(1)
+
 
 def load_secondary_rows(path: str, skip_header: bool) -> List[List[str]]:
     """Loads component rows from a secondary CSV file."""
@@ -60,6 +62,7 @@ def load_secondary_rows(path: str, skip_header: bool) -> List[List[str]]:
         print(f"Error reading secondary file '{path}': {e}", file=sys.stderr)
         sys.exit(1)
 
+
 def load_secondary_dict_rows(path: str) -> Tuple[List[Dict[str, str]], List[str]]:
     """Load secondary rows as dictionaries keyed by header names (required for template mode)."""
     try:
@@ -84,6 +87,7 @@ def load_secondary_dict_rows(path: str) -> Tuple[List[Dict[str, str]], List[str]
     except Exception as e:
         print(f"Error reading secondary file '{path}': {e}", file=sys.stderr)
         sys.exit(1)
+
 
 def load_templates(path: str) -> List[str]:
     """Load template strings from a single-column CSV file.
@@ -123,9 +127,11 @@ def load_templates(path: str) -> List[str]:
         print(f"Error reading template file '{path}': {e}", file=sys.stderr)
         sys.exit(1)
 
+
 def _extract_placeholders(tmpl: str) -> List[str]:
     """Extract placeholder names like {core}, {city} from a template string."""
     return re.findall(r'{([^{}]+)}', tmpl)
+
 
 def render_template(tmpl: str, mapping: Dict[str, str]) -> Optional[str]:
     """
@@ -146,6 +152,172 @@ def render_template(tmpl: str, mapping: Dict[str, str]) -> Optional[str]:
     result = " ".join(result.split()).strip()
     return result if result else None
 
+
+# ---- Multi-column template support ----
+
+def is_multi_column_template(path: str) -> bool:
+    """
+    Detect whether the template CSV has multiple columns.
+    Heuristic:
+      - Read first non-empty row; if it has >1 cells, treat as multi-column template table.
+      - Single-column template files are expected to have exactly one cell per row without headers.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row:
+                    continue
+                # If there are 2+ cells, consider it a table template
+                return len(row) > 1
+            return False
+    except FileNotFoundError:
+        print(f"Error: Template file not found at '{path}'", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error reading template file '{path}': {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def load_template_table(path: str) -> Tuple[List[str], List[List[str]]]:
+    """
+    Load a multi-column template CSV as (headers, rows).
+    - Requires a header row with 2 or more columns.
+    - Skips empty rows.
+    - Skips 'comment rows' whose first non-empty cell begins with '#'.
+    - Preserves columns exactly; each cell is trimmed. Rows are padded/truncated to header length.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.reader(f)
+            header: Optional[List[str]] = None
+            for row in reader:
+                if not row:
+                    continue
+                header = [ (c or "").strip() for c in row ]
+                break
+            if not header or len(header) < 2:
+                print(f"Error: Template CSV '{path}' must have a header row with at least 2 columns for multi-column templates.", file=sys.stderr)
+                sys.exit(1)
+
+            rows: List[List[str]] = []
+            for row in reader:
+                if not row or all((c or "").strip() == "" for c in row):
+                    continue
+                # comment row if first non-empty cell starts with '#'
+                first_non_empty = ""
+                for c in row:
+                    if (c or "").strip():
+                        first_non_empty = (c or "").strip()
+                        break
+                if first_non_empty.startswith("#"):
+                    continue
+
+                # normalize to header length
+                cells = [ (c or "").strip() for c in row[:len(header)] ]
+                if len(cells) < len(header):
+                    cells.extend([""] * (len(header) - len(cells)))
+                rows.append(cells)
+
+            if not rows:
+                print(f"Warning: No usable template rows found in '{path}'.", file=sys.stderr)
+            return header, rows
+    except FileNotFoundError:
+        print(f"Error: Template file not found at '{path}'", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error reading template file '{path}': {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _extract_placeholders_from_cells(cells: List[str]) -> List[str]:
+    """Extract placeholders from a list of cell strings."""
+    names: List[str] = []
+    for cell in cells:
+        names.extend(_extract_placeholders(cell))
+    return names
+
+
+def render_template_row(cells: List[str], mapping: Dict[str, str]) -> Optional[List[str]]:
+    """
+    Render a multi-column template row by replacing placeholders across all cells.
+    - All placeholders used in any cell must exist in mapping and be non-empty.
+    - Each cell is trimmed and internal spaces are collapsed.
+    - Returns None if any placeholder is missing or empty.
+    """
+    placeholders = _extract_placeholders_from_cells(cells)
+    for name in placeholders:
+        if name not in mapping:
+            return None
+        if not mapping[name]:
+            return None
+
+    rendered: List[str] = []
+    for text in cells:
+        out = text
+        for name in placeholders:
+            out = out.replace('{' + name + '}', mapping[name])
+        out = " ".join(out.split()).strip()
+        rendered.append(out)
+    return rendered
+
+
+def generate_rows_from_template_table_list_row_grouped(
+    core_keywords: List[str],
+    secondary_rows: List[Dict[str, str]],
+    template_rows: List[List[str]],
+) -> List[List[str]]:
+    """
+    Generate table rows in a stable order grouped by secondary rows, then by core, then by template row.
+    Order:
+      for each secondary row:
+        for each core phrase:
+          for each template row:
+            render -> append
+    """
+    out: List[List[str]] = []
+    for row in secondary_rows:
+        for core_phrase in core_keywords:
+            mapping: Dict[str, str] = dict(row)
+            mapping['core'] = core_phrase
+            for tmpl_cells in template_rows:
+                rendered = render_template_row(tmpl_cells, mapping)
+                if rendered:
+                    out.append(rendered)
+    return out
+
+
+def write_csv_output(path: str, headers: List[str], rows: Iterable[List[str]]) -> None:
+    """Write CSV with a header row to the specified output file, creating dirs if needed."""
+    try:
+        output_dir = os.path.dirname(path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with open(path, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            for r in rows:
+                writer.writerow(r)
+    except IOError as e:
+        print(f"Error: Could not write CSV output file '{path}': {e}", file=sys.stderr)
+        sys.exit(1)
+
+def dedupe_rows_preserve_order(rows: Iterable[List[str]]) -> List[List[str]]:
+    """
+    Stable de-duplication for multi-column template rows.
+    Compares complete rows (all columns) and preserves the first occurrence.
+    """
+    seen: Set[Tuple[str, ...]] = set()
+    out: List[List[str]] = []
+    for r in rows:
+        key = tuple(r)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+# ---- Existing single-string template/permute generation ----
+
 def generate_keywords_from_templates_list(
     core_keywords: List[str],
     secondary_rows: List[Dict[str, str]],
@@ -163,6 +335,7 @@ def generate_keywords_from_templates_list(
                     out.append(rendered)
     return out
 
+
 def build_keywords_from_templates(
     core_keywords: List[str],
     secondary_rows: List[Dict[str, str]],
@@ -170,6 +343,7 @@ def build_keywords_from_templates(
 ) -> Set[str]:
     """Generate a unique set of phrases using provided templates."""
     return set(generate_keywords_from_templates_list(core_keywords, secondary_rows, templates))
+
 
 # Row-grouped generation helpers
 def generate_keywords_from_templates_list_row_grouped(
@@ -196,6 +370,7 @@ def generate_keywords_from_templates_list_row_grouped(
                     out.append(rendered)
     return out
 
+
 def generate_all_keywords_list_row_grouped(
     core_keywords: List[str],
     secondary_rows: List[List[str]],
@@ -212,6 +387,7 @@ def generate_all_keywords_list_row_grouped(
             out.extend(phrases)
     return out
 
+
 def dedupe_preserve_order(keywords: Iterable[str]) -> List[str]:
     """Stable de-duplication that preserves the first occurrence order."""
     seen: Set[str] = set()
@@ -221,6 +397,7 @@ def dedupe_preserve_order(keywords: Iterable[str]) -> List[str]:
             seen.add(kw)
             out.append(kw)
     return out
+
 
 def generate_permutations_for_row(fields: List[str], min_fields: int) -> List[str]:
     """Generates all specified permutations for a single row's fields."""
@@ -260,6 +437,7 @@ def generate_keywords_with_core(core_phrase: str, fields: List[str], min_fields:
                     results.append(" ".join(parts))
     return results
 
+
 def build_keywords(
     core_keywords: List[str],
     secondary_rows: List[List[str]],
@@ -280,6 +458,7 @@ def build_keywords(
 
     return keywords
 
+
 def write_output(path: str, keywords: Iterable[str]):
     """Writes keywords to the specified output file, creating dirs if needed."""
     try:
@@ -294,6 +473,7 @@ def write_output(path: str, keywords: Iterable[str]):
     except IOError as e:
         print(f"Error: Could not write to output file '{path}': {e}", file=sys.stderr)
         sys.exit(1)
+
 
 def main():
     """Main function to parse arguments and run the keyword builder."""
@@ -314,14 +494,15 @@ def main():
     parser.add_argument(
         '--template',
         required=False,
-        help=("Optional path to a template CSV (single column) with rows containing placeholders like "
-              "{core} and {column_name}. When provided, generation uses these templates and the "
-              "secondary CSV MUST have a header row with the referenced column names.")
+        help=("Optional path to a template CSV. Supports two formats:\n"
+              "  - Single-column: rows are templates like '{core} in {city}, {state}'\n"
+              "  - Multi-column: a CSV table with headers; cells may contain placeholders. "
+              "The output will be a CSV preserving the template's headers and columns.")
     )
     parser.add_argument(
         '--output',
         required=True,
-        help="Path to the output text file."
+        help="Path to the output file (txt for single-column templates/permutations; csv for multi-column templates)."
     )
     parser.add_argument(
         '--core-column',
@@ -352,39 +533,105 @@ def main():
 
     if args.template:
         secondary_dict_rows, headers = load_secondary_dict_rows(args.secondary)
-        templates = load_templates(args.template)
 
-        # Validate that all placeholders used in templates are from headers or 'core'
-        allowed = set(['core'] + headers)
-        unknown: Set[str] = set()
-        for tmpl in templates:
-            for name in _extract_placeholders(tmpl):
-                if name not in allowed:
-                    unknown.add(name)
-        if unknown:
-            print(
-                "Error: Template contains unknown placeholders: " +
-                ", ".join("{" + n + "}" for n in sorted(unknown)),
-                file=sys.stderr,
+        # Branch: single-column template strings vs multi-column template table
+        if is_multi_column_template(args.template):
+            # Multi-column template table
+            tmpl_headers, tmpl_rows = load_template_table(args.template)
+
+            # Validate that all placeholders used across the table are from headers or 'core'
+            allowed = set(['core'] + headers)
+            unknown: Set[str] = set()
+            for cells in tmpl_rows:
+                for name in _extract_placeholders_from_cells(cells):
+                    if name not in allowed:
+                        unknown.add(name)
+            if unknown:
+                print(
+                    "Error: Template contains unknown placeholders: " +
+                    ", ".join("{" + n + "}" for n in sorted(unknown)),
+                    file=sys.stderr,
+                )
+                print(
+                    "Allowed placeholders are: " +
+                    ", ".join("{" + n + "}" for n in (['core'] + headers)),
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            if not core_keywords or not secondary_dict_rows or not tmpl_rows:
+                print("Error: Cannot generate rows. One or more inputs are empty or contain no usable data.", file=sys.stderr)
+                sys.exit(1)
+
+            # Row-grouped order: secondary row -> core -> template rows
+            raw_rows = generate_rows_from_template_table_list_row_grouped(
+                core_keywords,
+                secondary_dict_rows,
+                tmpl_rows
             )
-            print(
-                "Allowed placeholders are: " +
-                ", ".join("{" + n + "}" for n in (['core'] + headers)),
-                file=sys.stderr,
+            sec_count = len(secondary_dict_rows)
+
+            # Stable de-duplication of rows (preserve first occurrence)
+            unique_rows = dedupe_rows_preserve_order(raw_rows)
+
+            # Write CSV output
+            write_csv_output(args.output, tmpl_headers, unique_rows)
+
+            print("--- Summary ---")
+            print(f"Loaded {len(core_keywords)} core phrases.")
+            print(f"Loaded {sec_count} secondary rows.")
+            print(f"Used {len(tmpl_rows)} template rows across {len(tmpl_headers)} columns.")
+            print(f"Generated {len(unique_rows)} unique rows.")
+            print(f"Wrote CSV output to {args.output}")
+            return
+        else:
+            # Single-column templates (existing behavior)
+            templates = load_templates(args.template)
+
+            # Validate that all placeholders used in templates are from headers or 'core'
+            allowed = set(['core'] + headers)
+            unknown: Set[str] = set()
+            for tmpl in templates:
+                for name in _extract_placeholders(tmpl):
+                    if name not in allowed:
+                        unknown.add(name)
+            if unknown:
+                print(
+                    "Error: Template contains unknown placeholders: " +
+                    ", ".join("{" + n + "}" for n in sorted(unknown)),
+                    file=sys.stderr,
+                )
+                print(
+                    "Allowed placeholders are: " +
+                    ", ".join("{" + n + "}" for n in (['core'] + headers)),
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            if not core_keywords or not secondary_dict_rows or not templates:
+                print("Error: Cannot generate keywords. One or more inputs are empty or contain no usable data.", file=sys.stderr)
+                sys.exit(1)
+
+            # Row-grouped order: secondary row -> core -> templates
+            raw_keywords = generate_keywords_from_templates_list_row_grouped(
+                core_keywords,
+                secondary_dict_rows,
+                templates
             )
-            sys.exit(1)
+            sec_count = len(secondary_dict_rows)
 
-        if not core_keywords or not secondary_dict_rows or not templates:
-            print("Error: Cannot generate keywords. One or more inputs are empty or contain no usable data.", file=sys.stderr)
-            sys.exit(1)
+            # Stable de-duplication while preserving grouping order
+            unique_keywords = dedupe_preserve_order(raw_keywords)
 
-        # Row-grouped order: secondary row -> core -> templates
-        raw_keywords = generate_keywords_from_templates_list_row_grouped(
-            core_keywords,
-            secondary_dict_rows,
-            templates
-        )
-        sec_count = len(secondary_dict_rows)
+            write_output(args.output, unique_keywords)
+
+            print("--- Summary ---")
+            print(f"Loaded {len(core_keywords)} core phrases.")
+            print(f"Loaded {sec_count} secondary rows.")
+            print(f"Used {len(templates)} templates.")
+            print(f"Generated {len(unique_keywords)} unique keywords.")
+            print(f"Wrote output to {args.output}")
+            return
     else:
         secondary_rows = load_secondary_rows(args.secondary, args.skip_header)
 
@@ -400,18 +647,17 @@ def main():
         )
         sec_count = len(secondary_rows)
 
-    # Stable de-duplication while preserving grouping order
-    unique_keywords = dedupe_preserve_order(raw_keywords)
+        # Stable de-duplication while preserving grouping order
+        unique_keywords = dedupe_preserve_order(raw_keywords)
 
-    write_output(args.output, unique_keywords)
+        write_output(args.output, unique_keywords)
 
-    print("--- Summary ---")
-    print(f"Loaded {len(core_keywords)} core phrases.")
-    print(f"Loaded {sec_count} secondary rows.")
-    if args.template:
-        print(f"Used {len(templates)} templates.")
-    print(f"Generated {len(unique_keywords)} unique keywords.")
-    print(f"Wrote output to {args.output}")
+        print("--- Summary ---")
+        print(f"Loaded {len(core_keywords)} core phrases.")
+        print(f"Loaded {sec_count} secondary rows.")
+        print(f"Generated {len(unique_keywords)} unique keywords.")
+        print(f"Wrote output to {args.output}")
+
 
 if __name__ == "__main__":
     main()
